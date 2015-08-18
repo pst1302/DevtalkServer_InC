@@ -33,17 +33,35 @@ int main(int argc, char* argv[])
 	if (hServSock == INVALID_SOCKET) {
 		ErrorHandling("socket() error");
 	}
-
+	
 	// 서버 소켓 설정
 	memset(&servAddr, 0, sizeof(servAddr));
 	servAddr.sin_family = AF_INET;
 	servAddr.sin_addr.s_addr = htonl(INADDR_ANY);
 	servAddr.sin_port = htons(atoi(argv[1]));
 
+	fputs("서버 소켓 바인딩 중....\n", stdout);
+
 	// 소켓 바인드
 	if (bind(hServSock, (SOCKADDR*) &servAddr, sizeof(servAddr)) == SOCKET_ERROR) {
 		ErrorHandling("bind() error");
 	}
+
+	// 서버의 ip 주소 불러오기
+	char strAddrBuf[50];
+
+	int size = sizeof(strAddrBuf);
+
+	WSAAddressToString((SOCKADDR*)&servAddr, sizeof(servAddr), NULL, strAddrBuf, &size);
+
+	fputs("서버 소켓 생성....\n", stdout);
+	fputs("서버 ip주소 : ", stdout);
+	printf("%d", INADDR_ANY);
+	fputs(" 포트 : ", stdout);
+	fputs(argv[1], stdout);
+	fputs("\n", stdout);
+
+	fputs("서버 소켓 리스닝 중....\n", stdout);
 
 	// Listening
 	if (listen(hServSock, 5) == SOCKET_ERROR) {
