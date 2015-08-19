@@ -2,10 +2,20 @@
 #include<stdlib.h>
 #include<string.h>
 #include<WinSock2.h>
+#include<process.h>
+#include<windows.h>
 
 #define BUF_SIZE 1024
+#define MAX_CLNT 256
 
+unsigned WINAPI HandleClnt(void* arg);
+void SendMsg(char* msg, int len);
 void ErrorHandling(char* message);
+
+// 멀티 쓰레딩 관련 함수
+int clntCnt = 0;
+SOCKET clntSock[MAX_CLNT];
+HANDLE hMutex;
 
 int main(int argc, char* argv[]) 
 {
@@ -15,14 +25,12 @@ int main(int argc, char* argv[])
 	SOCKET hServSock, hClntSock;
 	SOCKADDR_IN servAdr, clntAdr;
 
-	// select 함수 관련 변수 
-	TIMEVAL timeout;
-	fd_set reads, cpyReads;
-	
+	// Thread 관련 변수
+	HANDLE hThread;
+
 	// 일반 변수
-	int adrSz;
-	int strLen, fdNum, i;
-	char buf[BUF_SIZE];
+	int clntAdrSz;
+
 
 	// main argc 유효성 검사
 	if (argc != 2) {
@@ -36,12 +44,16 @@ int main(int argc, char* argv[])
 		printf("Error Occured In WSAStartUp Call....\n");
 	}
 
-	// 서버 소켓 생성
+	// 뮤텍스 생성
+	hMutex = CreateMutex(NULL, FALSE, NULL);
+
+	// 서버 소켓 생성0
 	hServSock = socket(PF_INET, SOCK_STREAM, 0);
 	if (hServSock == INVALID_SOCKET) {
 		ErrorHandling("socket() error");
 	}
 	
+
 	// 서버 소켓 설정
 	memset(&servAdr, 0, sizeof(servAdr));
 	servAdr.sin_family = AF_INET;
@@ -55,20 +67,6 @@ int main(int argc, char* argv[])
 		ErrorHandling("bind() error");
 	}
 
-	// 서버의 ip 주소 불러오기
-	char strAddrBuf[50];
-
-	int size = sizeof(strAddrBuf);
-
-	WSAAddressToString((SOCKADDR*)&servAdr, sizeof(servAdr), NULL, strAddrBuf, &size);
-
-	fputs("서버 소켓 생성....\n", stdout);
-	fputs("서버 ip주소 : ", stdout);
-	printf("%d", INADDR_ANY);
-	fputs(" 포트 : ", stdout);
-	fputs(argv[1], stdout);
-	fputs("\n", stdout);
-
 	fputs("서버 소켓 리스닝 중....\n", stdout);
 
 	// Listening
@@ -76,52 +74,24 @@ int main(int argc, char* argv[])
 		ErrorHandling("listen() error!");
 	}
 	
-	FD_ZERO(&reads);
-	FD_SET(hServSock, &reads);
-
+	// 서버 응답 대기
 	while (1) {
-		cpyReads = reads;
 
-		timeout.tv_sec = 5;
-		timeout.tv_usec = 5000;
+		clntAdrSz = sizeof(clntAdr);
+		hClntSock = accept(hServSock, (SOCKADDR*)&clntAdr, &clntAdrSz);
 
-		if ((fdNum = select(0, &cpyReads, 0, 0, &timeout)) == SOCKET_ERROR)
-			break;
+		// 임계 영역
+		WaitForSingleObject(hMutex, INFINITE);
+		clntSock[clntCnt++] = hClntSock;
+		ReleaseMutex(hMutex);
 
-		if (fdNum == 0)
-			continue;
-
-		for (i = 0; i < reads.fd_count; i++) 
-		{
-			// Connection Request
-			if (FD_ISSET(reads.fd_array[i], &cpyReads)){
-				if (reads.fd_array[i] == hServSock) {
-					adrSz = sizeof(clntAdr);
-					hClntSock = accept(hServSock, (SOCKADDR*)&clntAdr, &adrSz);
-					FD_SET(hClntSock, &reads);
-					printf("connected client: %d \n", hClntSock);
-				}
-				else
-				{
-					strLen = recv(reads.fd_array[i], buf, BUF_SIZE - 1, 0);
-					// 메세지 전송 끝
-					if (strLen == 0) {
-						FD_CLR(reads.fd_array[i], &reads);
-						closesocket(cpyReads.fd_array[i]);
-						printf("close client: %d \n", cpyReads.fd_array[i]);
-					}
-					else {
-						send(reads.fd_array[i], buf, strLen, 0);	// echo
-					}
-				}
-			}
-		}
+		hThread = (HANDLE)_beginthreadex(NULL, 0, HandleClnt, (void*)&hClntSock, 0, NULL);
+		printf("Connect client IP: %s \n", inet_ntoa(clntAdr.sin_addr));
 	}
 
-
-	closesocket(hClntSock);
 	closesocket(hServSock);
 	WSACleanup();
+
 
 	// 자동 종료 방지
 	printf("if you want to shutdown the program, press any key..");
@@ -133,4 +103,46 @@ void ErrorHandling(char* message) {
 	fputs(message, stderr);
 	fputc('\n', stderr);
 	exit(1);
+}
+
+unsigned WINAPI HandleClnt(void* arg) {
+	
+	SOCKET hClntSock = *((SOCKET*)arg);
+	int strLen = 0, i;
+	char msg[BUF_SIZE];
+
+	while ((strLen = recv(hClntSock, msg, sizeof(msg), 0)) != 0)
+		SendMsg(msg, strLen);
+
+	// 임계 영역
+	WaitForSingleObject(hMutex, INFINITE);
+
+	for (i = 0; i < clntCnt; i++) {
+		if (hClntSock == clntSock[i])
+		{
+			while (i++ < clntCnt - 1)
+				clntSock[i] = clntSock[i + 1];
+			break;
+		}
+	}
+
+	clntCnt--;
+
+	ReleaseMutex(hMutex);
+	
+	closesocket(hClntSock);
+
+	return 0;
+}
+
+void SendMsg(char* msg, int len) {
+
+	int i;
+	
+	WaitForSingleObject(hMutex, INFINITE);
+	for (i = 0; i < clntCnt; i++)
+		send(clntSock[i], msg, len, 0);
+
+	ReleaseMutex(hMutex);
+
 }
