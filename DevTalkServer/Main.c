@@ -5,32 +5,34 @@
 #include<process.h>
 #include<windows.h>
 
-#define BUF_SIZE 1024
-#define MAX_CLNT 256
+// Define
+#define BUF_SIZE 100
 
-unsigned WINAPI HandleClnt(void* arg);
-void SendMsg(char* msg, int len);
-void ErrorHandling(char* message);
+// Socket 연결 끊어질 때 그 부분 빼고 다시 재배열 하는 함수
+void CompressSockets(SOCKET hSockArr[], int idx, int total);
+void CompressEvents(SOCKET hEventArr[], int idx, int total);
 
-// 멀티 쓰레딩 관련 함수
-int clntCnt = 0;
-SOCKET clntSock[MAX_CLNT];
-HANDLE hMutex;
+void ErrorHandling(char* msg);
 
 int main(int argc, char* argv[]) 
 {
-
-	// Socket 관련 변수들
+	// Socket관련 변수
 	WSADATA wsaData;
 	SOCKET hServSock, hClntSock;
 	SOCKADDR_IN servAdr, clntAdr;
 
-	// Thread 관련 변수
-	HANDLE hThread;
+	// Notification 관련 변수
+	SOCKET hSockArr[WSA_MAXIMUM_WAIT_EVENTS];
+	WSAEVENT hEventArr[WSA_MAXIMUM_WAIT_EVENTS];
+	WSAEVENT newEvent;
+	WSANETWORKEVENTS netEvents;
 
 	// 일반 변수
-	int clntAdrSz;
-
+	int numOfClntSock = 0;
+	int strLen, i;
+	int posInfo, startIdx;
+	int clntAdrLen;
+	char msg[BUF_SIZE];
 
 	// main argc 유효성 검사
 	if (argc != 2) {
@@ -39,21 +41,16 @@ int main(int argc, char* argv[])
 		exit(1);
 	}
 
-	// WSA 시작
-	if (WSAStartup(MAKEWORD(2, 2), &wsaData) != 0) {
-		printf("Error Occured In WSAStartUp Call....\n");
-	}
+	// WSAStartup 
+	if (WSAStartup(MAKEWORD(2, 2), &wsaData) != 0)
+		ErrorHandling("WSAStartup() error!");
 
-	// 뮤텍스 생성
-	hMutex = CreateMutex(NULL, FALSE, NULL);
-
-	// 서버 소켓 생성0
+	// 서버 소켓 생성
 	hServSock = socket(PF_INET, SOCK_STREAM, 0);
 	if (hServSock == INVALID_SOCKET) {
 		ErrorHandling("socket() error");
 	}
 	
-
 	// 서버 소켓 설정
 	memset(&servAdr, 0, sizeof(servAdr));
 	servAdr.sin_family = AF_INET;
@@ -74,19 +71,104 @@ int main(int argc, char* argv[])
 		ErrorHandling("listen() error!");
 	}
 	
-	// 서버 응답 대기
+	// 서버소켓 FD_ACCEPT 대기, 이벤트 연결
+	newEvent = WSACreateEvent();
+	if (WSAEventSelect(hServSock, newEvent, FD_ACCEPT) == SOCKET_ERROR)
+		ErrorHandling("WSAEventSelect error!");
+
+	// 서버 소켓은 0번 인덱스
+	hSockArr[numOfClntSock] = hServSock;
+	hEventArr[numOfClntSock] = newEvent;
+	numOfClntSock++;
+
 	while (1) {
+		
+		// Event가 활성화된 맨 첫번째 Index 읽어옴
+		posInfo = WSAWaitForMultipleEvents(numOfClntSock, hEventArr, FALSE, WSA_INFINITE, FALSE);
+		startIdx = posInfo - WSA_WAIT_EVENT_0;
 
-		clntAdrSz = sizeof(clntAdr);
-		hClntSock = accept(hServSock, (SOCKADDR*)&clntAdr, &clntAdrSz);
 
-		// 임계 영역
-		WaitForSingleObject(hMutex, INFINITE);
-		clntSock[clntCnt++] = hClntSock;
-		ReleaseMutex(hMutex);
+		for (i = startIdx; i < numOfClntSock; i++) {
+			
+			// 1개씩 이벤트가 활성화 되었는지 조사
+			int sigEventIdx = WSAWaitForMultipleEvents(1, hEventArr, TRUE, 0, FALSE);
 
-		hThread = (HANDLE)_beginthreadex(NULL, 0, HandleClnt, (void*)&hClntSock, 0, NULL);
-		printf("Connect client IP: %s \n", inet_ntoa(clntAdr.sin_addr));
+			// 타임아웃 되거나 Wait 실패 했을때 다음 이벤트 조사로 넘어감
+			if ((sigEventIdx == WSA_WAIT_FAILED) || (sigEventIdx == WSA_WAIT_TIMEOUT))
+				continue;
+			// 이벤트가 활성화 되어있으면 소켓 읽음
+			else {
+				sigEventIdx = i;
+				
+				// 현재 소켓과 이벤트로 netEvent 설정
+				WSAEnumNetworkEvents(hSockArr[sigEventIdx], hEventArr[sigEventIdx], &netEvents);
+
+				// Event의 타입에 맞는 로직 수행
+				if (netEvents.lNetworkEvents & FD_ACCEPT) {		// 연결 요청시
+
+					if (netEvents.iErrorCode[FD_ACCEPT_BIT] != 0) {		// 에러 처리
+						puts("Accept Error");
+						break;
+					}
+
+					// 소켓 연결
+					clntAdrLen = sizeof(clntAdr);
+					hClntSock = accept(hSockArr[sigEventIdx], (SOCKADDR*)&clntAdr, &clntAdrLen);
+
+					// 이벤트 생성후 클라이언트 소켓에 이벤트 연결
+					newEvent = WSACreateEvent();
+					WSAEventSelect(hClntSock, newEvent, FD_READ | FD_CLOSE);
+
+					// 이벤트/Socket 배열에 저장
+					hEventArr[numOfClntSock] = newEvent;
+					hSockArr[numOfClntSock] = hClntSock;
+					numOfClntSock++;
+
+					puts("connected new Client...");
+				}
+				
+				// 읽을 데이타가 있음을 알리는 이벤트일 떄
+				if (netEvents.lNetworkEvents & FD_READ) {
+					
+					// 에러 처리
+					if (netEvents.iErrorCode[FD_READ_BIT] != 0)
+					{
+						puts("Read Error");
+						break;
+					}
+					
+					// 읽은 다음에 에코
+					strLen = recv(hSockArr[sigEventIdx], msg, sizeof(msg), 0);
+
+					printf("Client : %d , Message : %s\n", sigEventIdx, msg);
+					printf("Echo complete\n");
+
+					send(hSockArr[sigEventIdx], msg, strLen, 0);
+				}
+
+				// 종료 요청시
+				if (netEvents.lNetworkEvents & FD_CLOSE) {
+					
+					// 에러 처리
+					if (netEvents.iErrorCode[FD_CLOSE_BIT] != 0)
+					{
+						puts("Close Error");
+						break;
+					}
+
+					printf("client : %d. close", sigEventIdx);
+
+					// 이벤트/socket close
+					WSACloseEvent(hEventArr[sigEventIdx]);
+					closesocket(hSockArr[sigEventIdx]);
+					numOfClntSock--;
+
+					// 배열 재배치
+					CompressEvents(hEventArr, sigEventIdx, numOfClntSock);
+					CompressSockets(hSockArr, sigEventIdx, numOfClntSock);
+				}
+			}
+		}
 	}
 
 	closesocket(hServSock);
@@ -105,44 +187,18 @@ void ErrorHandling(char* message) {
 	exit(1);
 }
 
-unsigned WINAPI HandleClnt(void* arg) {
+// Socket 재배열
+void CompressSockets(SOCKET hSockArr[], int idx, int total) {
 	
-	SOCKET hClntSock = *((SOCKET*)arg);
-	int strLen = 0, i;
-	char msg[BUF_SIZE];
-
-	while ((strLen = recv(hClntSock, msg, sizeof(msg), 0)) != 0)
-		SendMsg(msg, strLen);
-
-	// 임계 영역
-	WaitForSingleObject(hMutex, INFINITE);
-
-	for (i = 0; i < clntCnt; i++) {
-		if (hClntSock == clntSock[i])
-		{
-			while (i++ < clntCnt - 1)
-				clntSock[i] = clntSock[i + 1];
-			break;
-		}
-	}
-
-	clntCnt--;
-
-	ReleaseMutex(hMutex);
-	
-	closesocket(hClntSock);
-
-	return 0;
+	int i;
+	for (i = idx; i < total; i++)
+		hSockArr[i] = hSockArr[i + 1];
 }
 
-void SendMsg(char* msg, int len) {
-
-	int i;
+// Event 재배열
+void CompressEvents(SOCKET hEventArr[], int idx, int total) {
 	
-	WaitForSingleObject(hMutex, INFINITE);
-	for (i = 0; i < clntCnt; i++)
-		send(clntSock[i], msg, len, 0);
-
-	ReleaseMutex(hMutex);
-
+	int i;
+	for (i = idx; i < total; i++)
+		hEventArr[i] = hEventArr[i + 1];
 }
