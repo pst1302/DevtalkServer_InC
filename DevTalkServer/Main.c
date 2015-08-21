@@ -5,25 +5,28 @@
 #include<process.h>
 #include<windows.h>
 
-#define BUF_SIZE 100
+#define BUF_SIZE 1024
+#define MAX_CLNT 256
 
-void CompressSockets(SOCKET hSockArr[], int idx, int total);
-void CompressEvents(WSAEVENT hEventArr[], int idx, int total);
+unsigned WINAPI HandleClnt(void* arg);
+void SendMsg(char* msg, int len);
 void ErrorHandling(char* message);
+
+// 멀티 쓰레딩 관련 함수
+int clntCnt = 0;
+SOCKET clntSock[MAX_CLNT];
+HANDLE hMutex;
 
 int main(int argc, char* argv[]) 
 {
-	
-	// 소켓 관련 변수
+
+	// Socket 관련 변수들
 	WSADATA wsaData;
 	SOCKET hServSock, hClntSock;
 	SOCKADDR_IN servAdr, clntAdr;
 
-	// 비동기 Notification 관련 변수
-	SOCKET hSockArr[WSA_MAXIMUM_WAIT_EVENTS];
-	WSAEVENT hEventArr[WSA_MAXIMUM_WAIT_EVENTS];
-	WSAEVENT newEvent;
-	WSANETWORKEVENTS netEvents;
+	// Thread 관련 변수
+	HANDLE hThread;
 
 	// 일반 변수
 	int numOfClntSock = 0;
@@ -32,16 +35,29 @@ int main(int argc, char* argv[])
 	int clntAdrLen;
 	char msg[BUF_SIZE];
 
+
+	// main argc 유효성 검사
 	if (argc != 2) {
 		printf("Usage : %s <port>", argv[0]);
 		exit(1);
 	}
 
+	// WSA 시작
 	if (WSAStartup(MAKEWORD(2, 2), &wsaData) != 0) {
-		ErrorHandling("WSAStartup error!");
+		printf("Error Occured In WSAStartUp Call....\n");
 	}
 
+	// 뮤텍스 생성
+	hMutex = CreateMutex(NULL, FALSE, NULL);
+
+	// 서버 소켓 생성0
 	hServSock = socket(PF_INET, SOCK_STREAM, 0);
+	if (hServSock == INVALID_SOCKET) {
+		ErrorHandling("socket() error");
+	}
+	
+
+	// 서버 소켓 설정
 	memset(&servAdr, 0, sizeof(servAdr));
 	servAdr.sin_family = AF_INET;
 	servAdr.sin_addr.s_addr = htonl(INADDR_ANY);
@@ -56,79 +72,26 @@ int main(int argc, char* argv[])
 	if (listen(hServSock, 5) == SOCKET_ERROR) {
 		ErrorHandling("listen error");
 	}
-
-	// Event 생성
-	newEvent = WSACreateEvent();
-	if (WSAEventSelect(hServSock, newEvent, FD_ACCEPT) == SOCKET_ERROR)
-		ErrorHandling("WSAEventSelect error");
-
-	hSockArr[numOfClntSock] = hServSock;
-	hEventArr[numOfClntSock] = newEvent;
-	numOfClntSock++;
-
+	
+	// 서버 응답 대기
 	while (1) {
 		posInfo = WSAWaitForMultipleEvents(numOfClntSock, hEventArr, FALSE, WSA_INFINITE, FALSE);
 		startIdx = posInfo - WSA_WAIT_EVENT_0;
 
-		for (i = startIdx; i < numOfClntSock; i++) {
+		clntAdrSz = sizeof(clntAdr);
+		hClntSock = accept(hServSock, (SOCKADDR*)&clntAdr, &clntAdrSz);
 
-			// 이벤트 설정
-			int sigEventIdx = WSAWaitForMultipleEvents(1, &hEventArr[i], TRUE, 0, FALSE);
+		// 임계 영역
+		WaitForSingleObject(hMutex, INFINITE);
+		clntSock[clntCnt++] = hClntSock;
+		ReleaseMutex(hMutex);
 
-			if ((sigEventIdx == WSA_WAIT_FAILED || sigEventIdx == WSA_WAIT_TIMEOUT))
-				continue;
-			else {
-
-				sigEventIdx = i;
-
-				WSAEnumNetworkEvents(hSockArr[sigEventIdx], hEventArr[sigEventIdx], &netEvents);
-
-				if (netEvents.lNetworkEvents & FD_ACCEPT) {
-					if (netEvents.iErrorCode[FD_ACCEPT_BIT] != 0){
-						puts("Accept Error");
-						break;
-					}
-
-					clntAdrLen = sizeof(clntAdr);
-					hClntSock = accept(hSockArr[sigEventIdx], (SOCKADDR*)&clntAdr, &clntAdrLen);
-					newEvent = WSACreateEvent();
-					WSAEventSelect(hClntSock, newEvent, FD_READ | FD_CLOSE);
-
-					hEventArr[numOfClntSock] = newEvent;
-					hSockArr[numOfClntSock] = hClntSock;
-
-					numOfClntSock++;
-
-					puts("connected new client....");
-				}
-
-				if (netEvents.lNetworkEvents & FD_READ) {
-					if (netEvents.iErrorCode[FD_READ_BIT] != 0)	{
-						puts("Read Error");
-						break;
-					}
-					strLen = recv(hSockArr[sigEventIdx], msg, sizeof(msg), 0);
-					send(hSockArr[sigEventIdx], msg, strLen, 0);
-				}
-
-				if (netEvents.lNetworkEvents & FD_CLOSE) {
-					if (netEvents.iErrorCode[FD_CLOSE_BIT] != 0) {
-						puts("Close Error");
-						break;
-					}
-					WSACloseEvent(hEventArr[sigEventIdx]);
-					closesocket(hSockArr[sigEventIdx]);
-
-					numOfClntSock--;
-					CompressSockets(hSockArr, sigEventIdx, numOfClntSock);
-					CompressEvents(hEventArr, sigEventIdx, numOfClntSock);
-				}
-			}
-		}
+		hThread = (HANDLE)_beginthreadex(NULL, 0, HandleClnt, (void*)&hClntSock, 0, NULL);
+		printf("Connect client IP: %s \n", inet_ntoa(clntAdr.sin_addr));
 	}
 
+	closesocket(hServSock);
 	WSACleanup();
-	return 0;
 
 
 	// 자동 종료 방지
@@ -143,15 +106,49 @@ void ErrorHandling(char* message) {
 	exit(1);
 }
 
-void CompressSockets(SOCKET hSockArr[], int idx, int total) {
+unsigned WINAPI HandleClnt(void* arg) {
 	
-	int i;
-	for (i = idx; i < total; i++)
-		hSockArr[i] = hSockArr[i + 1];
+	SOCKET hClntSock = *((SOCKET*)arg);
+	int strLen = 0, i;
+	char msg[BUF_SIZE];
+
+	while ((strLen = recv(hClntSock, msg, sizeof(msg), 0)) != 0)
+		SendMsg(msg, strLen);
+
+	// 임계 영역
+	WaitForSingleObject(hMutex, INFINITE);
+
+	for (i = 0; i < clntCnt; i++) {
+		if (hClntSock == clntSock[i])
+		{
+			while (i++ < clntCnt - 1)
+				clntSock[i] = clntSock[i + 1];
+			break;
+		}
+	}
+					WSACloseEvent(hEventArr[sigEventIdx]);
+					closesocket(hSockArr[sigEventIdx]);
+
+	clntCnt--;
+
+	ReleaseMutex(hMutex);
+	
+
+	// 자동 종료 방지
+	printf("if you want to shutdown the program, press any key..");
+	getchar();
+	return 0;
 }
 
+void SendMsg(char* msg, int len) {
 
-void CompressEvents(WSAEVENT hEventArr[], int idx, int total) {
+	int i;
+	
+	WaitForSingleObject(hMutex, INFINITE);
+	for (i = 0; i < clntCnt; i++)
+		send(clntSock[i], msg, len, 0);
+
+	ReleaseMutex(hMutex);
 
 	int i;
 	for (i = idx; i < total; i++)
