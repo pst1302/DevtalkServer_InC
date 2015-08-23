@@ -5,6 +5,8 @@
 #include<process.h>
 #include<windows.h>
 
+#define _WINSOCK_DEPRECATED_NO_WARNINGS = 10;
+
 void ErrorHandling(char* msg);
 
 int main(int argc, char* argv[]) {
@@ -24,7 +26,7 @@ int main(int argc, char* argv[]) {
 	WSAOVERLAPPED overlapped;
 
 	if (argc != 3) {
-		printf("Usage : %s <ip> <port>\n", argv[0);
+		printf("Usage : %s <ip> <port>\n", argv[0]);
 		getchar();
 		exit(1);
 	}
@@ -38,10 +40,10 @@ int main(int argc, char* argv[]) {
 	memset(&sendAdr, 0, sizeof(sendAdr));
 	sendAdr.sin_family = AF_INET;
 	sendAdr.sin_addr.s_addr = inet_addr(argv[1]);
-	sendAdr.sin_port = htos(atoi(argv[2]));
+	sendAdr.sin_port = htons(atoi(argv[2]));
 
 	// 소켓 연결
-	if (connect(hSocket, &sendAdr, sizeof(sendAdr))) {
+	if (connect(hSocket, (SOCKADDR*)&sendAdr, sizeof(sendAdr))) {
 		ErrorHandling("connect error");
 	}
 
