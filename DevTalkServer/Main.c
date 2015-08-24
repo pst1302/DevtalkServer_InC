@@ -5,85 +5,80 @@
 #include<process.h>
 
 #define BUF_SIZE 1024
+#define READ 3
+#define WRITE 5
 
-void CALLBACK ReadCompRoutine(DWORD, DWORD, LPWSAOVERLAPPED, DWORD);
-void CALLBACK WriteCompRoutine(DWORD, DWORD, LPWSAOVERLAPPED, DWORD);
-void ErrorHandling(char* msg);
-
+// socket infomation
 typedef struct {
 	SOCKET hClntSock;
-	char buf[BUF_SIZE];
+	SOCKADDR_IN clntAdr;
+} PER_HANDLE_DATA, *LPPER_HANDLE_DATA;
+
+// buffer infomation
+typedef struct {
+	OVERLAPPED overlapped;
 	WSABUF wsaBuf;
-}PER_IO_DATA, *LPPER_IO_DATA;
+	char buffer[BUF_SIZE];
+	int rwMode;
+} PER_IO_DATA, *LPPER_IO_DATA;
+
+DWORD WINAPI EchoThreadMain(LPVOID pComPort);
+void ErrorHandling(char* msg);
 
 int main(int argc, char* argv[]) {
 
-	// 소켓 관련 변수
 	WSADATA wsaData;
-	SOCKET hLisnSock, hRecvSock;
-	SOCKADDR_IN lisnAdr, recvAdr;
+
+	// IOCP 관련 변수
+	HANDLE hComPort;
+	SYSTEM_INFO sysInfo;
+	LPPER_IO_DATA ioInfo;
+	LPPER_HANDLE_DATA handleInfo;
+
+	SOCKET hServSock;
+	SOCKADDR_IN servAdr;
+	int recvBytes, i, flags = 0;
 	
-	// Overlapped 변수
-	LPWSAOVERLAPPED lpOvLp;
-	DWORD recvBytes;
-	LPPER_IO_DATA hbInfo;
-	int mode = 1, recvAdrSz, flagInfo = 0;
-
-	if (argc != 2)
-	{
-		printf("Usage : %s <port>\n", argv[0]);
-		getchar();
-		exit(1);
-	}
-
 	if (WSAStartup(MAKEWORD(2, 2), &wsaData) != 0)
 		ErrorHandling("WSAStartup error");
 
-	hLisnSock = WSASocketW(PF_INET, SOCK_STREAM, 0, NULL, 0, WSA_FLAG_OVERLAPPED);
-	ioctlsocket(hLisnSock, FIONBIO, &mode);	// non-blocking
+	hComPort = CreateIoCompletionPort(INVALID_HANDLE_VALUE, NULL, 0, 0);
+	GetSystemInfo(&sysInfo);
+	for (i = 0; i < sysInfo.dwNumberOfProcessors; i++)
+		_beginthreadex(NULL, 0, EchoThreadMain, (LPVOID)hComPort, 0, NULL);
 
-	memset(&lisnAdr, 0, sizeof(lisnAdr));
-	lisnAdr.sin_family = AF_INET;
-	lisnAdr.sin_addr.s_addr = htonl(INADDR_ANY);
-	lisnAdr.sin_port = htons(atoi(argv[1]));
+	hServSock = WSASocketW(AF_INET, SOCK_STREAM, 0, NULL, 0, WSA_FLAG_OVERLAPPED);
+	memset(&servAdr, 0, sizeof(servAdr));
+	servAdr.sin_family = AF_INET;
+	servAdr.sin_addr.s_addr = htonl(INADDR_ANY);
+	servAdr.sin_port = htons(atoi(argv[1]));
 
-	if (bind(hLisnSock, (SOCKADDR*)&lisnAdr, sizeof(lisnAdr)) == SOCKET_ERROR)
-		ErrorHandling("bind error");
+	bind(hServSock, (SOCKADDR*)&servAdr, sizeof(servAdr));
+	listen(hServSock, 5);
 
-	if (listen(hLisnSock, 5) == SOCKET_ERROR)
-		ErrorHandling("listen error");
-
-	// accept
-	recvAdrSz = sizeof(recvAdr);
 	while (1) {
-		SleepEx(100, TRUE);
-		hRecvSock = accept(hLisnSock, (SOCKADDR*)&recvAdr, &recvAdrSz);
-		if (hRecvSock == INVALID_SOCKET){
-			if (WSAGetLastError() == WSAEWOULDBLOCK)
-				continue;
-			else
-				ErrorHandling("accept() error");
-		}
-		puts("Client connected........");
 
-		// overlap 변수 메모리 할당 및 셋팅
-		lpOvLp = (LPWSAOVERLAPPED)malloc(sizeof(WSAOVERLAPPED));
-		memset(lpOvLp, 0, sizeof(WSAOVERLAPPED));
+		// Client Socket information
+		SOCKET hClntSock;
+		SOCKADDR_IN clntAdr;
 
-		// LPPER_IO_DATA 메모리 할당 및 셋팅
-		hbInfo = (LPPER_IO_DATA)malloc(sizeof(PER_IO_DATA));
-		hbInfo->hClntSock = (DWORD)hRecvSock;
-		(hbInfo->wsaBuf).buf = hbInfo->buf;
-		(hbInfo->wsaBuf).len = BUF_SIZE;
+		// accept
+		int addrLen = sizeof(clntAdr);
+		hClntSock = accept(hServSock, (SOCKADDR*)&clntAdr, &addrLen);
+		handleInfo = (LPPER_HANDLE_DATA)malloc(sizeof(PER_HANDLE_DATA));
+		handleInfo->hClntSock = hClntSock;
+		memcpy(&(handleInfo->clntAdr), &clntAdr, addrLen);
+		
+		// CP와 Client Socket 연결
+		CreateIoCompletionPort((HANDLE)hClntSock, hComPort, (DWORD)handleInfo, 0);
 
-		// Receive
-		lpOvLp->hEvent = (HANDLE)hbInfo;
-		WSARecv(hRecvSock, &(hbInfo->wsaBuf), 1, &recvBytes, &flagInfo, lpOvLp, ReadCompRoutine);
+		ioInfo = (LPPER_IO_DATA)malloc(sizeof(PER_IO_DATA));
+		memset(&(ioInfo->overlapped), 0, sizeof(OVERLAPPED));
+		ioInfo->wsaBuf.len = BUF_SIZE;
+		ioInfo->wsaBuf.buf = ioInfo->buffer;
+		ioInfo->rwMode = READ;
+		WSARecv(handleInfo->hClntSock, &(ioInfo->wsaBuf), 1, &recvBytes, &flags, &(ioInfo->overlapped), NULL);
 	}
-
-	closesocket(hRecvSock);
-	closesocket(hLisnSock);
-	WSACleanup();
 
 	getchar();
 	return 0;
@@ -96,32 +91,44 @@ void ErrorHandling(char* msg) {
 	exit(1);
 }
 
+DWORD WINAPI EchoThreadMain(LPVOID pComPort) {
 
-void CALLBACK ReadCompRoutine(DWORD dwError, DWORD szRecvBytes, LPWSAOVERLAPPED lpOverlapped, DWORD flags) {
-	
-	LPPER_IO_DATA hbInfo = (LPPER_IO_DATA)(lpOverlapped->hEvent);
-	SOCKET hSock = hbInfo->hClntSock;
-	LPWSABUF bufInfo = &(hbInfo->wsaBuf);
-	DWORD sentBytes;
+	HANDLE hComPort = (HANDLE)pComPort;
+	SOCKET sock;
+	DWORD bytesTrans;
+	LPPER_HANDLE_DATA handleInfo;
+	LPPER_IO_DATA ioInfo;
+	DWORD flags = 0;
 
-	if (szRecvBytes == 0)
-	{
-		closesocket(hSock);
-		free(lpOverlapped->hEvent); free(lpOverlapped);
-		puts("Client disconnected....");
+	while (1) {
+		GetQueuedCompletionStatus(hComPort, &bytesTrans, (LPDWORD)&handleInfo, (LPOVERLAPPED*)&ioInfo, INFINITE);
+		sock = handleInfo->hClntSock;
+
+		if (ioInfo->rwMode == READ) {
+			puts("message received!");
+			if (bytesTrans == 0) {
+				closesocket(sock);
+				free(handleInfo); free(ioInfo);
+				continue;
+			}
+
+			memset(&(ioInfo->overlapped), 0, sizeof(OVERLAPPED));
+			ioInfo->wsaBuf.len = bytesTrans;
+			ioInfo->rwMode = WRITE;
+			WSASend(sock, &(ioInfo->wsaBuf), 1, NULL, 0, &(ioInfo->overlapped), NULL);
+
+			ioInfo = (LPPER_IO_DATA)malloc(sizeof(PER_IO_DATA));
+			memset(&(ioInfo->overlapped), 0, sizeof(OVERLAPPED));
+			ioInfo->wsaBuf.len = BUF_SIZE;
+			ioInfo->wsaBuf.buf = ioInfo->buffer;
+			ioInfo->rwMode = READ;
+			WSARecv(sock, &(ioInfo->wsaBuf), 1, NULL, &flags, &(ioInfo->overlapped), NULL);
+		}
+		else {
+			puts("message sent!");
+			free(ioInfo);
+		} 
 	}
-	else {		// echo
-		bufInfo->len = szRecvBytes;
-		WSASend(hSock, bufInfo, 1, &sentBytes, 0, lpOverlapped, WriteCompRoutine);
-	}
-}
-void CALLBACK WriteCompRoutine(DWORD dwError, DWORD szSendBytes, LPWSAOVERLAPPED lpOverlapped, DWORD flags) {
 
-	LPPER_IO_DATA hbInfo = (LPPER_IO_DATA)(lpOverlapped->hEvent);
-	SOCKET hSock = hbInfo->hClntSock;
-	LPWSABUF bufInfo = &(hbInfo->wsaBuf);
-	DWORD recvBytes;
-	int flagInfo = 0;
-
-	WSARecv(hSock, bufInfo, 1, &recvBytes, &flagInfo, lpOverlapped, ReadCompRoutine);
+	return 0;
 }
